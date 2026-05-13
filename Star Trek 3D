@@ -1,0 +1,1021 @@
+import React, { useState, useEffect, useRef, useCallback } from 'react';
+
+// --- CONSTANTS ---
+const GALAXY_SIZE = 10;
+const SECTOR_SIZE = 10;
+const MAX_ENERGY = 3000;
+const MAX_TORPEDOES = 10;
+const MAX_SHIELDS = 1000;
+const MIN_WARP_ENERGY = 150;
+
+const TILE_EMPTY = 0;
+const TILE_PLAYER = 1;
+const TILE_KLINGON = 2;
+const TILE_BASE = 3;
+const TILE_STAR = 4;
+
+// --- SVGS ---
+const IconShip = () => (
+  <svg viewBox="0 0 24 24" fill="currentColor" className="w-full h-full text-cyan-400 drop-shadow-[0_0_5px_rgba(34,211,238,0.8)]">
+    <ellipse cx="12" cy="10" rx="8" ry="4" />
+    <path d="M11 14 h2 v4 h-2 z" />
+    <rect x="6" y="18" width="3" height="4" />
+    <rect x="15" y="18" width="3" height="4" />
+    <path d="M5 16 h14 v2 h-14 z" />
+  </svg>
+);
+
+const IconKlingon = () => (
+  <svg viewBox="0 0 24 24" fill="currentColor" className="w-full h-full text-red-500 drop-shadow-[0_0_5px_rgba(239,68,68,0.8)]">
+    <path d="M12 2 L15 10 L22 12 L19 14 L12 11 L5 14 L2 12 L9 10 Z" />
+    <path d="M10 11 L14 11 L13 20 L11 20 Z" />
+  </svg>
+);
+
+const IconBase = () => (
+  <svg viewBox="0 0 24 24" fill="currentColor" className="w-full h-full text-green-400 drop-shadow-[0_0_5px_rgba(74,222,128,0.8)]">
+    <circle cx="12" cy="12" r="5" />
+    <rect x="11" y="2" width="2" height="20" />
+    <rect x="2" y="11" width="20" height="2" />
+    <circle cx="12" cy="12" r="2" className="text-black" fill="black" />
+  </svg>
+);
+
+const IconStar = () => (
+  <svg viewBox="0 0 24 24" fill="currentColor" className="w-full h-full text-yellow-300 drop-shadow-[0_0_5px_rgba(253,224,71,0.8)]">
+    <polygon points="12,2 15,9 22,9 16,14 18,21 12,17 6,21 8,14 2,9 9,9" />
+  </svg>
+);
+
+// --- UTILS ---
+const randomInt = (max) => Math.floor(Math.random() * max);
+const distance2D = (x1, y1, x2, y2) => Math.sqrt(Math.pow(x2 - x1, 2) + Math.pow(y2 - y1, 2));
+const distance3D = (x1, y1, z1, x2, y2, z2) => Math.sqrt(Math.pow(x2 - x1, 2) + Math.pow(y2 - y1, 2) + Math.pow(z2 - z1, 2));
+
+export default function App() {
+  // --- STATE ---
+  const [gameState, setGameState] = useState('START'); // START, PLAYING, GAMEOVER, WIN
+  const [learningMode, setLearningMode] = useState(false); // TRUE for math mode
+  const [galaxy, setGalaxy] = useState([]); // 3D array: [z][y][x]
+  const [totalKlingons, setTotalKlingons] = useState(0);
+  const [stardate, setStardate] = useState(3000);
+  const [warpCount, setWarpCount] = useState(0);
+  
+  const [player, setPlayer] = useState({
+    qZ: 0, qY: 0, qX: 0,
+    sY: 0, sX: 0,
+    energy: MAX_ENERGY,
+    torpedoes: MAX_TORPEDOES,
+    shields: 0
+  });
+
+  const [sectorMap, setSectorMap] = useState([]); // 2D array [y][x]
+  const [enemies, setEnemies] = useState([]); // Array of { id, sX, sY, hp }
+  const [animations, setAnimations] = useState([]); // Firing animations
+  const [confirmAction, setConfirmAction] = useState(null); // Low energy warning
+  
+  const [logs, setLogs] = useState([]);
+  const logsEndRef = useRef(null);
+
+  // UI State
+  const [view, setView] = useState('SECTOR'); // SECTOR, GALAXY
+  const [galaxyZView, setGalaxyZView] = useState(0);
+  const [commandMode, setCommandMode] = useState('IMPULSE'); // IMPULSE, TORPEDO
+  const [phaserInput, setPhaserInput] = useState(100);
+  const [shieldInput, setShieldInput] = useState(100);
+
+  // Learning Mode State
+  const [navX, setNavX] = useState('');
+  const [navY, setNavY] = useState('');
+  const [navZ, setNavZ] = useState('');
+  const [hoverPos, setHoverPos] = useState(null);
+
+  // --- LOGGING ---
+  const logMsg = useCallback((msg, indent = false) => {
+    setLogs((prev) => {
+      const prefix = indent ? "            " : `[SD ${stardate.toFixed(1)}] `;
+      return [...prev, `${prefix}${msg}`];
+    });
+  }, [stardate]);
+
+  const fireBeam = (sX, sY, tX, tY, color) => {
+    const id = Date.now() + Math.random();
+    setAnimations(prev => [...prev, { id, sX, sY, tX, tY, color }]);
+    setTimeout(() => {
+      setAnimations(prev => prev.filter(a => a.id !== id));
+    }, 400); // Animation duration
+  };
+
+  useEffect(() => {
+    // block: 'nearest' ensures ONLY the log container scrolls, preventing the whole screen from jumping down
+    logsEndRef.current?.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  }, [logs]);
+
+  // --- INITIALIZATION ---
+  const initGame = (mode = 'CLASSIC') => {
+    const isLearning = mode === 'LEARNING';
+    setLearningMode(isLearning);
+
+    let newGalaxy = [];
+    let kCount = 0;
+
+    // Build 10x10x10 Galaxy
+    for (let z = 0; z < GALAXY_SIZE; z++) {
+      let layer = [];
+      for (let y = 0; y < GALAXY_SIZE; y++) {
+        let row = [];
+        for (let x = 0; x < GALAXY_SIZE; x++) {
+          let k = 0, b = 0, s = randomInt(5) + 1;
+          
+          if (Math.random() < 0.1) {
+            k = randomInt(3) + 1;
+            kCount += k;
+          }
+          if (Math.random() < 0.02) b = 1;
+
+          row.push({ k, b, s, explored: false });
+        }
+        layer.push(row);
+      }
+      newGalaxy.push(layer);
+    }
+
+    setGalaxy(newGalaxy);
+    setTotalKlingons(kCount);
+    
+    const startZ = randomInt(GALAXY_SIZE);
+    const startY = randomInt(GALAXY_SIZE);
+    const startX = randomInt(GALAXY_SIZE);
+
+    if (newGalaxy[startZ][startY][startX].b === 0) {
+      newGalaxy[startZ][startY][startX].b = 1;
+    }
+
+    const initialPlayer = {
+      qZ: startZ, qY: startY, qX: startX,
+      sY: randomInt(SECTOR_SIZE), sX: randomInt(SECTOR_SIZE),
+      energy: MAX_ENERGY,
+      torpedoes: MAX_TORPEDOES,
+      shields: 0
+    };
+
+    setPlayer(initialPlayer);
+    setGalaxyZView(startZ);
+    setStardate(3000);
+    setWarpCount(0);
+    
+    const introLogs = [
+      "WELCOME TO STARFLEET COMMAND.", 
+      "YOUR MISSION: DESTROY ALL KLINGONS IN THE 3D GALAXY SECTOR.", 
+      `TOTAL KLINGONS DETECTED: ${kCount}`,
+    ];
+
+    if (isLearning) {
+      introLogs.push("LEARNING MODE ACTIVE: MANUAL COORDINATE ENTRY REQUIRED FOR NAV & TACTICAL.");
+    } else {
+      introLogs.push("NOTE: L.R. SCAN FORMAT IS [KBS] (KLINGONS, BASES, STARS).");
+    }
+
+    setLogs(introLogs);
+    setGameState('PLAYING');
+    setView('SECTOR');
+    setCommandMode('IMPULSE');
+    setNavX(''); setNavY(''); setNavZ('');
+
+    loadSector(startZ, startY, startX, initialPlayer.sY, initialPlayer.sX, newGalaxy);
+  };
+
+  const loadSector = (qZ, qY, qX, pSy, pSx, currentGalaxy) => {
+    const quad = currentGalaxy[qZ][qY][qX];
+    let newSector = Array(SECTOR_SIZE).fill(null).map(() => Array(SECTOR_SIZE).fill(TILE_EMPTY));
+    let newEnemies = [];
+    let entityId = 0;
+
+    let galCopy = [...currentGalaxy];
+    galCopy[qZ][qY][qX].explored = true;
+    setGalaxy(galCopy);
+
+    const placeRandomly = (tileType, count) => {
+      let placed = 0;
+      while (placed < count) {
+        let y = randomInt(SECTOR_SIZE);
+        let x = randomInt(SECTOR_SIZE);
+        if (newSector[y][x] === TILE_EMPTY && (y !== pSy || x !== pSx)) {
+          newSector[y][x] = tileType;
+          if (tileType === TILE_KLINGON) {
+            newEnemies.push({ id: entityId++, sY: y, sX: x, hp: 200 });
+          }
+          placed++;
+        }
+      }
+    };
+
+    placeRandomly(TILE_STAR, quad.s);
+    placeRandomly(TILE_BASE, quad.b);
+    placeRandomly(TILE_KLINGON, quad.k);
+    
+    newSector[pSy][pSx] = TILE_PLAYER;
+
+    setSectorMap(newSector);
+    setEnemies(newEnemies);
+    
+    if (quad.k > 0) logMsg(`RED ALERT: ${quad.k} KLINGON(S) DETECTED IN SECTOR.`);
+    if (quad.b > 0) logMsg(`SENSORS DETECT FEDERATION STARBASE.`);
+  };
+
+  // --- CORE MECHANICS ---
+  const withEnergyCheck = (cost, actionCallback) => {
+    if (player.energy >= MIN_WARP_ENERGY && (player.energy - cost) < MIN_WARP_ENERGY) {
+      setConfirmAction({
+        message: `WARNING: This action costs ${cost} energy and will drop your reserves below the minimum warp threshold (${MIN_WARP_ENERGY}). You may become stranded. Proceed?`,
+        onConfirm: () => {
+          setConfirmAction(null);
+          actionCallback();
+        },
+        onCancel: () => {
+          setConfirmAction(null);
+          logMsg("ACTION ABORTED BY COMMANDER.");
+        }
+      });
+    } else {
+      actionCallback();
+    }
+  };
+
+  const checkStarBasking = (pY, pX, currentSectorMap, currentEnergy) => {
+    if (currentEnergy > 30) return currentEnergy; 
+    
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        let ny = pY + dy;
+        let nx = pX + dx;
+        if (ny >= 0 && ny < SECTOR_SIZE && nx >= 0 && nx < SECTOR_SIZE) {
+          if (currentSectorMap[ny][nx] === TILE_STAR) {
+            logMsg("EMERGENCY SOLAR SIPHON ENGAGED. ABSORBED 100 ENERGY FROM NEARBY STAR.");
+            return currentEnergy + 100;
+          }
+        }
+      }
+    }
+    return currentEnergy;
+  };
+
+  const klingonTurn = (currentEnemies, pY, pX, currentShields, currentEnergy) => {
+    let updatedShields = currentShields;
+    let updatedEnergy = currentEnergy;
+
+    currentEnemies.forEach(k => {
+      fireBeam(k.sX, k.sY, pX, pY, 'text-red-500');
+      const dist = distance2D(pX, pY, k.sX, k.sY);
+      let hitChance = 1 - (dist * 0.05);
+      if (Math.random() < hitChance) {
+        let damage = Math.floor(Math.random() * 50) + 20;
+        
+        if (updatedShields >= damage) {
+          updatedShields -= damage;
+          logMsg(`KLINGON FIRES! SHIELDS ABSORBED ${damage} DMG.`);
+        } else {
+          let rem = damage - updatedShields;
+          updatedShields = 0;
+          updatedEnergy -= rem;
+          logMsg(`KLINGON FIRES! SHIELDS DOWN. SHIP TOOK ${rem} DMG.`);
+        }
+      } else {
+        logMsg(`KLINGON FIRES AND MISSES.`);
+      }
+    });
+
+    setPlayer(p => ({ ...p, shields: updatedShields, energy: updatedEnergy }));
+    checkGameOver(updatedEnergy);
+  };
+
+  const checkGameOver = (energy) => {
+    if (energy <= 0) {
+      logMsg("ENERGY DEPLETED. LIFE SUPPORT FAILING. HULL BREACH DETECTED...");
+      setGameState('GAMEOVER');
+    } else if (totalKlingons <= 0) {
+      setGameState('WIN');
+    }
+  };
+
+  const handleCellClick = (y, x) => {
+    if (gameState !== 'PLAYING' || confirmAction) return;
+    
+    // In Learning mode, clicking is disabled to enforce typing coordinates.
+    if (learningMode) return; 
+
+    if (view === 'SECTOR') {
+      if (commandMode === 'IMPULSE') {
+        executeImpulse(y, x);
+      } else if (commandMode === 'TORPEDO') {
+        executeTorpedo(y, x);
+        setCommandMode('IMPULSE');
+      }
+    } else if (view === 'GALAXY') {
+       executeWarp(galaxyZView, y, x);
+    }
+  };
+
+  const handleManualEngage = () => {
+    const tX = parseInt(navX);
+    const tY = parseInt(navY);
+    
+    if (isNaN(tX) || isNaN(tY) || tX < 0 || tX > 9 || tY < 0 || tY > 9) {
+      logMsg("NAV COMPUTER ERROR: INVALID X OR Y COORDINATES.");
+      return;
+    }
+
+    if (view === 'SECTOR') {
+      if (commandMode === 'IMPULSE') executeImpulse(tY, tX);
+      else if (commandMode === 'TORPEDO') executeTorpedo(tY, tX);
+    } else if (view === 'GALAXY') {
+      const tZ = parseInt(navZ);
+      if (isNaN(tZ) || tZ < 0 || tZ > 9) {
+        logMsg("NAV COMPUTER ERROR: INVALID Z COORDINATE.");
+        return;
+      }
+      executeWarp(tZ, tY, tX);
+    }
+
+    setNavX(''); setNavY(''); setNavZ('');
+  };
+
+  const moveKlingons = (currentGalaxy) => {
+    let newGal = currentGalaxy.map(z => z.map(y => y.map(x => ({ ...x, k: 0 }))));
+    for (let z = 0; z < GALAXY_SIZE; z++) {
+      for (let y = 0; y < GALAXY_SIZE; y++) {
+        for (let x = 0; x < GALAXY_SIZE; x++) {
+          let kCount = currentGalaxy[z][y][x].k;
+          for (let i = 0; i < kCount; i++) {
+            let dz = randomInt(3) - 1; 
+            let dy = randomInt(3) - 1;
+            let dx = randomInt(3) - 1;
+            let nz = z + dz, ny = y + dy, nx = x + dx;
+            if (nz >= 0 && nz < GALAXY_SIZE && ny >= 0 && ny < GALAXY_SIZE && nx >= 0 && nx < GALAXY_SIZE) {
+              newGal[nz][ny][nx].k += 1;
+            } else {
+              newGal[z][y][x].k += 1;
+            }
+          }
+        }
+      }
+    }
+    return newGal;
+  };
+
+  const executeImpulse = (targetY, targetX) => {
+    if (sectorMap[targetY][targetX] !== TILE_EMPTY) {
+      logMsg("NAVIGATION ERROR: DESTINATION OBSTRUCTED.");
+      return;
+    }
+
+    const dist = distance2D(player.sX, player.sY, targetX, targetY);
+    const cost = Math.floor(dist * 10);
+
+    if (player.energy < cost) {
+      logMsg("INSUFFICIENT ENERGY FOR IMPULSE.");
+      return;
+    }
+
+    let willDock = false;
+    for (let dy = -1; dy <= 1; dy++) {
+      for (let dx = -1; dx <= 1; dx++) {
+        let ny = targetY + dy;
+        let nx = targetX + dx;
+        if (ny >= 0 && ny < SECTOR_SIZE && nx >= 0 && nx < SECTOR_SIZE) {
+          if (sectorMap[ny][nx] === TILE_BASE) willDock = true;
+        }
+      }
+    }
+
+    withEnergyCheck(willDock ? 0 : cost, () => {
+      let newMap = [...sectorMap.map(row => [...row])];
+      newMap[player.sY][player.sX] = TILE_EMPTY;
+      newMap[targetY][targetX] = TILE_PLAYER;
+      
+      setSectorMap(newMap);
+      setStardate(s => s + 0.1);
+      
+      logMsg(`IMPULSE ENGINES ENGAGED. COST: ${cost} ENERGY.`);
+      
+      let newEnergy = player.energy - cost;
+      newEnergy = checkStarBasking(targetY, targetX, newMap, newEnergy);
+      let finalShields = player.shields;
+
+      if (willDock) {
+        logMsg("DOCKING SEQUENCE INITIATED. ENERGY AND TORPEDOES RESTORED. SHIELDS LOWERED.");
+        newEnergy = MAX_ENERGY;
+        finalShields = 0;
+        setPlayer(p => ({ ...p, sY: targetY, sX: targetX, energy: MAX_ENERGY, torpedoes: MAX_TORPEDOES, shields: 0 }));
+      } else {
+        setPlayer(p => ({ ...p, sY: targetY, sX: targetX, energy: newEnergy }));
+      }
+      
+      if (enemies.length > 0) klingonTurn(enemies, targetY, targetX, finalShields, newEnergy);
+      else checkGameOver(newEnergy);
+    });
+  };
+
+  const executeWarp = (targetZ, targetY, targetX) => {
+    if (targetZ === player.qZ && targetY === player.qY && targetX === player.qX) {
+      setView('SECTOR');
+      return;
+    }
+
+    const dist = distance3D(player.qX, player.qY, player.qZ, targetX, targetY, targetZ);
+    const cost = Math.floor(dist * 150);
+
+    if (player.energy < cost) {
+      logMsg(`INSUFFICIENT ENERGY FOR WARP TO ${targetX},${targetY},${targetZ}. NEED ${cost}.`);
+      return;
+    }
+
+    withEnergyCheck(cost, () => {
+      let nextWarpCount = warpCount + 1;
+      setWarpCount(nextWarpCount);
+      
+      let currentGal = galaxy;
+      if (nextWarpCount % 4 === 0) {
+        logMsg("SUB-SPACE CHATTER DETECTED: KLINGON FLEET IS ON THE MOVE.");
+        currentGal = moveKlingons(currentGal);
+        setGalaxy(currentGal);
+      }
+
+      logMsg(`WARP DRIVE ENGAGED. ENTERING QUADRANT [${targetX},${targetY},${targetZ}]. COST: ${cost}.`);
+      
+      let newPlayer = { ...player, qZ: targetZ, qY: targetY, qX: targetX, sY: randomInt(SECTOR_SIZE), sX: randomInt(SECTOR_SIZE), energy: player.energy - cost };
+      setPlayer(newPlayer);
+      setStardate(s => s + Math.floor(dist));
+      setView('SECTOR');
+      
+      loadSector(targetZ, targetY, targetX, newPlayer.sY, newPlayer.sX, currentGal);
+      checkGameOver(newPlayer.energy);
+    });
+  };
+
+  const executePhasers = () => {
+    const energyToFire = parseInt(phaserInput);
+    if (isNaN(energyToFire) || energyToFire <= 0) return;
+    if (player.energy < energyToFire) {
+      logMsg("INSUFFICIENT ENERGY FOR PHASERS.");
+      return;
+    }
+
+    if (enemies.length === 0) {
+       logMsg("NO TARGETS IN SECTOR. PHASERS ABORTED.");
+       return;
+    }
+
+    withEnergyCheck(energyToFire, () => {
+      logMsg(`FIRING PHASERS WITH ${energyToFire} ENERGY...`);
+      setPlayer(p => ({ ...p, energy: p.energy - energyToFire }));
+      
+      let activeEnemies = [...enemies];
+      let newSectorMap = [...sectorMap.map(row => [...row])];
+      let galCopy = [...galaxy];
+      let klingonsDestroyedThisTurn = 0;
+
+      const damagePerEnemy = energyToFire / activeEnemies.length;
+
+      activeEnemies = activeEnemies.filter(k => {
+        fireBeam(player.sX, player.sY, k.sX, k.sY, 'text-cyan-400');
+        const dist = Math.max(1, distance2D(player.sX, player.sY, k.sX, k.sY));
+        const damage = Math.floor(damagePerEnemy * (2 / dist)); 
+        
+        k.hp -= damage;
+        logMsg(`TARGET AT [${k.sX},${k.sY}] TOOK ${damage} DMG.`);
+        
+        if (k.hp <= 0) {
+          logMsg("KLINGON DESTROYED!");
+          newSectorMap[k.sY][k.sX] = TILE_EMPTY;
+          klingonsDestroyedThisTurn++;
+          return false;
+        }
+        return true; 
+      });
+
+      if (klingonsDestroyedThisTurn > 0) {
+         galCopy[player.qZ][player.qY][player.qX].k -= klingonsDestroyedThisTurn;
+         setGalaxy(galCopy);
+         setTotalKlingons(prev => prev - klingonsDestroyedThisTurn);
+      }
+
+      setEnemies(activeEnemies);
+      setSectorMap(newSectorMap);
+      
+      if (activeEnemies.length > 0) klingonTurn(activeEnemies, player.sY, player.sX, player.shields, player.energy - energyToFire);
+      else checkGameOver(player.energy - energyToFire);
+    });
+  };
+
+  const executeTorpedo = (targetY, targetX) => {
+    if (player.torpedoes <= 0) {
+      logMsg("OUT OF PHOTON TORPEDOES.");
+      return;
+    }
+
+    setPlayer(p => ({ ...p, torpedoes: p.torpedoes - 1 }));
+    logMsg("TORPEDO FIRED.");
+
+    let dx = targetX - player.sX;
+    let dy = targetY - player.sY;
+    let steps = Math.max(Math.abs(dx), Math.abs(dy));
+    
+    let xInc = dx / steps;
+    let yInc = dy / steps;
+
+    let hit = false;
+    let newSectorMap = [...sectorMap.map(row => [...row])];
+    let newEnemies = [...enemies];
+    let galCopy = [...galaxy];
+
+    let finalX = player.sX;
+    let finalY = player.sY;
+
+    for (let i = 1; i <= steps; i++) {
+      let cy = Math.round(player.sY + yInc * i);
+      let cx = Math.round(player.sX + xInc * i);
+
+      finalX = cx;
+      finalY = cy;
+
+      if (cy < 0 || cy >= SECTOR_SIZE || cx < 0 || cx >= SECTOR_SIZE) break;
+
+      let tile = newSectorMap[cy][cx];
+      if (tile !== TILE_EMPTY && tile !== TILE_PLAYER) {
+        hit = true;
+        if (tile === TILE_STAR) {
+          logMsg(`TORPEDO HIT A STAR AT [${cx},${cy}] AND WAS ABSORBED.`);
+        } else if (tile === TILE_BASE) {
+          logMsg(`STARFLEET COMMAND: YOU DESTROYED A STARBASE AT [${cx},${cy}]! PENALTY ASSESSED.`);
+          newSectorMap[cy][cx] = TILE_EMPTY;
+          galCopy[player.qZ][player.qY][player.qX].b -= 1;
+          setPlayer(p => ({...p, energy: Math.max(0, p.energy - 1000)}));
+        } else if (tile === TILE_KLINGON) {
+          logMsg(`DIRECT HIT AT [${cx},${cy}]. KLINGON DESTROYED!`);
+          newSectorMap[cy][cx] = TILE_EMPTY;
+          newEnemies = newEnemies.filter(k => !(k.sX === cx && k.sY === cy));
+          galCopy[player.qZ][player.qY][player.qX].k -= 1;
+          setTotalKlingons(prev => prev - 1);
+        }
+        break; 
+      }
+    }
+
+    fireBeam(player.sX, player.sY, finalX, finalY, 'text-yellow-400'); 
+
+    if (!hit) logMsg("TORPEDO MISSED.");
+
+    setSectorMap(newSectorMap);
+    setEnemies(newEnemies);
+    setGalaxy(galCopy);
+
+    if (newEnemies.length > 0) klingonTurn(newEnemies, player.sY, player.sX, player.shields, player.energy);
+    else checkGameOver(player.energy);
+  };
+
+  const handleShields = () => {
+    let amount = parseInt(shieldInput);
+    if (isNaN(amount) || amount < 0) return;
+    if (amount > MAX_SHIELDS) amount = MAX_SHIELDS;
+    const diff = amount - player.shields;
+    
+    if (diff > 0) {
+      if (player.energy < diff) {
+        logMsg("INSUFFICIENT ENERGY TO RAISE SHIELDS.");
+        return;
+      }
+      withEnergyCheck(diff, () => {
+        setPlayer(p => ({ ...p, shields: amount, energy: p.energy - diff }));
+        logMsg(`SHIELDS RAISED TO ${amount}.`);
+      });
+    } else if (diff < 0) {
+      setPlayer(p => ({ ...p, shields: amount, energy: Math.min(MAX_ENERGY, p.energy - diff) }));
+      logMsg(`SHIELDS LOWERED TO ${amount}. ENERGY RETURNED.`);
+    }
+  };
+
+  const useLongRangeSensors = () => {
+    if (player.energy < 50) {
+       logMsg("INSUFFICIENT ENERGY FOR LRS.");
+       return;
+    }
+    
+    withEnergyCheck(50, () => {
+      setPlayer(p => ({ ...p, energy: p.energy - 50 }));
+      let galCopy = [...galaxy];
+      
+      for (let dz = -1; dz <= 1; dz++) {
+        for (let dy = -1; dy <= 1; dy++) {
+          for (let dx = -1; dx <= 1; dx++) {
+            let z = player.qZ + dz;
+            let y = player.qY + dy;
+            let x = player.qX + dx;
+            if (z >= 0 && z < GALAXY_SIZE && y >= 0 && y < GALAXY_SIZE && x >= 0 && x < GALAXY_SIZE) {
+              galCopy[z][y][x].explored = true;
+            }
+          }
+        }
+      }
+      setGalaxy(galCopy);
+      logMsg(`LONG RANGE SENSORS ACTIVATED (Z-LEVEL ${player.qZ}):`);
+      
+      for (let dy = 1; dy >= -1; dy--) {
+        let rowStr = "";
+        for (let dx = -1; dx <= 1; dx++) {
+          let y = player.qY + dy;
+          let x = player.qX + dx;
+          if (y >= 0 && y < GALAXY_SIZE && x >= 0 && x < GALAXY_SIZE) {
+            let q = galCopy[player.qZ][y][x];
+            rowStr += `[${q.k}${q.b}${q.s}] `;
+          } else {
+            rowStr += "[***] ";
+          }
+        }
+        logMsg(rowStr.trim(), true);
+      }
+      
+      logMsg("ADJACENT 3D SECTORS MAPPED ON GALAXY SCAN.");
+      setView('GALAXY');
+      setGalaxyZView(player.qZ);
+    });
+  };
+
+  const locateNearestStarbase = () => {
+    if (player.energy < 20) {
+      logMsg("INSUFFICIENT ENERGY FOR DEEP SPACE SENSORS.");
+      return;
+    }
+    
+    withEnergyCheck(20, () => {
+      setPlayer(p => ({ ...p, energy: p.energy - 20 }));
+      
+      let minDist = Infinity;
+      let nearestBase = null;
+
+      for (let z = 0; z < GALAXY_SIZE; z++) {
+        for (let y = 0; y < GALAXY_SIZE; y++) {
+          for (let x = 0; x < GALAXY_SIZE; x++) {
+            if (galaxy[z][y][x].b > 0) {
+              let dist = distance3D(player.qX, player.qY, player.qZ, x, y, z);
+              if (dist < minDist) {
+                minDist = dist;
+                nearestBase = { x, y, z };
+              }
+            }
+          }
+        }
+      }
+
+      if (nearestBase) {
+        logMsg(`NAV COMPUTER: NEAREST STARBASE AT QUADRANT [X:${nearestBase.x} Y:${nearestBase.y} Z:${nearestBase.z}].`);
+      } else {
+        logMsg("NAV COMPUTER: NO ACTIVE STARBASES DETECTED IN THE GALAXY.");
+      }
+    });
+  };
+
+  // --- RENDERING HELPERS ---
+  const renderCell = (y, x) => {
+    if (view === 'SECTOR') {
+      const tile = sectorMap[y][x];
+      return (
+        <div 
+          key={`${y}-${x}`} 
+          onClick={() => handleCellClick(y, x)}
+          onMouseEnter={() => learningMode && setHoverPos({x, y})}
+          className={`w-full h-full border border-green-900/50 flex items-center justify-center cursor-pointer hover:bg-green-900/30
+            ${commandMode === 'TORPEDO' ? 'hover:border-red-500' : 'hover:border-green-400'}`}
+        >
+          {tile === TILE_PLAYER && <div className="w-3/4 h-3/4"><IconShip/></div>}
+          {tile === TILE_KLINGON && <div className="w-3/4 h-3/4"><IconKlingon/></div>}
+          {tile === TILE_BASE && <div className="w-3/4 h-3/4"><IconBase/></div>}
+          {tile === TILE_STAR && <div className="w-3/4 h-3/4"><IconStar/></div>}
+        </div>
+      );
+    } else {
+      // GALAXY VIEW
+      if (!galaxy.length) return null;
+      const quad = galaxy[galaxyZView][y][x];
+      const isPlayerHere = player.qZ === galaxyZView && player.qY === y && player.qX === x;
+      
+      return (
+        <div 
+          key={`${y}-${x}`} 
+          onClick={() => handleCellClick(y, x)}
+          onMouseEnter={() => learningMode && setHoverPos({x, y})}
+          className={`w-full h-full border border-green-800 flex items-center justify-center cursor-pointer hover:bg-green-800/50 relative
+            ${isPlayerHere ? 'bg-green-900/40' : ''}`}
+        >
+          {quad.explored ? (
+             <div className="text-xs md:text-sm font-bold tracking-widest text-green-400">
+               <span className={quad.k > 0 ? 'text-red-400' : ''}>{quad.k}</span>
+               <span className={quad.b > 0 ? 'text-green-300' : ''}>{quad.b}</span>
+               <span className={quad.s > 0 ? 'text-yellow-400' : ''}>{quad.s}</span>
+             </div>
+          ) : (
+             <div className="text-xs md:text-sm text-green-900">???</div>
+          )}
+          {isPlayerHere && <div className="absolute top-0 right-0 w-2 h-2 bg-cyan-400 rounded-full animate-pulse"></div>}
+        </div>
+      );
+    }
+  };
+
+  const getConditionColor = () => {
+    if (enemies.length > 0) return 'text-red-500';
+    if (player.energy < 500) return 'text-yellow-500';
+    return 'text-green-500';
+  };
+
+  // Live Math Output for Learning Mode
+  const renderNavMath = () => {
+    const tX = parseInt(navX); const tY = parseInt(navY); const tZ = parseInt(navZ);
+    if (isNaN(tX) || isNaN(tY)) return null;
+
+    if (view === 'SECTOR') {
+      const dx = tX - player.sX; const dy = tY - player.sY;
+      const dist = distance2D(player.sX, player.sY, tX, tY);
+      return (
+          <div className="text-[10px] sm:text-xs text-cyan-300 font-mono space-y-1 bg-cyan-950/50 p-2 border border-cyan-900/50">
+            <div>ΔX = {tX} - {player.sX} = {dx}</div>
+            <div>ΔY = {tY} - {player.sY} = {dy}</div>
+            <div className="text-cyan-500">d = √(ΔX² + ΔY²)</div>
+            <div>d = √(({dx})² + ({dy})²)</div>
+            <div>d = √({dx*dx} + {dy*dy}) = √{dx*dx + dy*dy}</div>
+            <div className="text-yellow-400 font-bold">Distance ≈ {dist.toFixed(2)} units</div>
+            <div className="text-green-400">Cost: {commandMode === 'IMPULSE' ? Math.floor(dist * 10) : '1 Torpedo'} {commandMode === 'IMPULSE' ? 'Energy' : ''}</div>
+          </div>
+      );
+    } else if (view === 'GALAXY' && !isNaN(tZ)) {
+      const dx = tX - player.qX; const dy = tY - player.qY; const dz = tZ - player.qZ;
+      const dist = distance3D(player.qX, player.qY, player.qZ, tX, tY, tZ);
+      return (
+          <div className="text-[10px] sm:text-xs text-cyan-300 font-mono space-y-1 bg-cyan-950/50 p-2 border border-cyan-900/50">
+            <div>ΔX = {dx}, ΔY = {dy}, ΔZ = {dz}</div>
+            <div className="text-cyan-500">d = √(ΔX² + ΔY² + ΔZ²)</div>
+            <div>d = √({dx*dx} + {dy*dy} + {dz*dz}) = √{dx*dx + dy*dy + dz*dz}</div>
+            <div className="text-yellow-400 font-bold">Distance ≈ {dist.toFixed(2)} units</div>
+            <div className="text-green-400">Cost: {Math.floor(dist * 150)} Energy</div>
+          </div>
+      );
+    }
+    return null;
+  };
+
+  // --- MAIN RENDER ---
+  return (
+    <div className="min-h-screen bg-black text-green-500 font-mono p-4 flex flex-col items-center selection:bg-green-900 selection:text-green-200">
+      
+      <div className="w-full max-w-6xl mx-auto flex flex-col h-full border-2 border-green-700 rounded-lg overflow-hidden shadow-[0_0_20px_rgba(21,128,61,0.5)] relative">
+        
+        {/* HEADER */}
+        <div className="bg-green-900/30 border-b-2 border-green-700 p-3 flex justify-between items-center px-6">
+          <h1 className="text-xl md:text-2xl font-bold tracking-widest drop-shadow-[0_0_5px_rgba(34,197,94,0.8)]">SUPER STAR TREK : 3D GALAXY</h1>
+          <div className="flex items-center gap-4">
+            <div className="text-sm md:text-base hidden sm:block">STARDATE {stardate.toFixed(1)}</div>
+            {gameState !== 'START' && (
+              <button onClick={() => setGameState('START')} className="px-3 py-1 border border-green-500 text-xs hover:bg-green-500 hover:text-black font-bold transition-colors">
+                RESTART
+              </button>
+            )}
+          </div>
+        </div>
+
+        {gameState === 'START' && (
+          <div className="flex-1 flex flex-col items-center justify-center p-10 text-center space-y-6">
+             <div className="w-32 h-32 mb-6 animate-pulse"><IconShip /></div>
+             <h2 className="text-3xl mb-4 font-bold">AWAITING ORDERS</h2>
+             <p className="max-w-xl text-green-400">
+               Command the starship across a 10x10x10 3D Galaxy grid.<br/>
+               Find and eliminate all Klingons before your energy depletes.<br/>
+               Dock at Starbases to recharge.
+             </p>
+             <div className="flex flex-col sm:flex-row gap-6 mt-8">
+               <button onClick={() => initGame('CLASSIC')} className="px-8 py-4 border-2 border-green-500 hover:bg-green-500 hover:text-black font-bold text-xl transition-colors">
+                 CLASSIC MODE
+               </button>
+               <button onClick={() => initGame('LEARNING')} className="px-8 py-4 border-2 border-cyan-500 hover:bg-cyan-500 hover:text-black font-bold text-xl transition-colors text-cyan-400">
+                 LEARNING MODE
+               </button>
+             </div>
+             <p className="text-xs text-cyan-500 mt-2 max-w-md">Learning mode disables mouse navigation and requires manual Cartesian coordinate (X,Y,Z) entry to move and fight.</p>
+          </div>
+        )}
+
+        {(gameState === 'PLAYING' || gameState === 'GAMEOVER' || gameState === 'WIN') && (
+          <div className="flex-1 flex flex-col lg:flex-row h-full overflow-hidden">
+            
+            {/* LEFT PANEL - MAP */}
+            <div className="lg:w-2/3 p-4 flex flex-col border-b-2 lg:border-b-0 lg:border-r-2 border-green-700 bg-black relative">
+              <div className="flex justify-between items-center mb-4">
+                <h2 className="text-xl font-bold tracking-widest">
+                  {view === 'SECTOR' ? `SECTOR [${player.qX},${player.qY},${player.qZ}] SCAN` : `GALAXY MAP (Z-LEVEL ${galaxyZView})`}
+                </h2>
+                
+                {view === 'GALAXY' && (
+                   <div className="flex items-center space-x-2">
+                     <span className="text-sm">Z-LEVEL:</span>
+                     <button onClick={() => setGalaxyZView(Math.max(0, galaxyZView - 1))} className="px-2 py-1 border border-green-500 hover:bg-green-700">-</button>
+                     <span className="px-2 font-bold">{galaxyZView}</span>
+                     <button onClick={() => setGalaxyZView(Math.min(9, galaxyZView + 1))} className="px-2 py-1 border border-green-500 hover:bg-green-700">+</button>
+                   </div>
+                )}
+              </div>
+
+              {/* GRID AREA WITH AXES */}
+              <div className="flex-1 flex flex-col items-center w-full max-w-3xl mx-auto relative select-none">
+                
+                {/* Float Coordinate Tooltip */}
+                {learningMode && hoverPos && (
+                    <div className="absolute top-0 right-0 -mt-2 bg-black/90 text-cyan-300 px-3 py-1 border border-cyan-800 rounded z-20 text-sm font-mono shadow-[0_0_10px_rgba(34,211,238,0.2)]">
+                        Target: {view === 'SECTOR' ? `(${hoverPos.x}, ${hoverPos.y})` : `(${hoverPos.x}, ${hoverPos.y}, ${galaxyZView})`}
+                    </div>
+                )}
+
+                <div className="flex w-full h-full max-h-[60vh] lg:max-h-[70vh]">
+                  {/* Y-Axis Labels (Left) */}
+                  {learningMode && (
+                      <div className="flex flex-col w-6 mr-1 pt-1 pb-1 font-bold">
+                          {Array.from({length: 10}).map((_, i) => (
+                            <div key={i} className="flex-1 flex items-center justify-center text-xs sm:text-sm text-cyan-500">{9-i}</div>
+                          ))}
+                      </div>
+                  )}
+
+                  {/* Main Interactive Grid */}
+                  <div 
+                    className="flex-1 aspect-square grid grid-cols-10 grid-rows-10 border-2 border-green-700 bg-green-950/10 p-1 relative overflow-hidden"
+                    onMouseLeave={() => setHoverPos(null)}
+                  >
+                    {view === 'SECTOR' && animations.length > 0 && (
+                      <svg className="absolute inset-1 w-full h-full pointer-events-none z-10">
+                        {animations.map(anim => (
+                          <g key={anim.id} className={anim.color}>
+                            <line
+                              x1={`${(anim.sX + 0.5) * 10}%`} y1={`${(9 - anim.sY + 0.5) * 10}%`}
+                              x2={`${(anim.tX + 0.5) * 10}%`} y2={`${(9 - anim.tY + 0.5) * 10}%`}
+                              stroke="currentColor" strokeWidth="2" strokeDasharray="4 4" className="opacity-40"
+                            />
+                            <circle r="4" fill="currentColor" className="drop-shadow-[0_0_8px_currentColor]">
+                              <animate attributeName="cx" values={`${(anim.sX + 0.5) * 10}%;${(anim.tX + 0.5) * 10}%`} dur="0.4s" fill="freeze" />
+                              <animate attributeName="cy" values={`${(9 - anim.sY + 0.5) * 10}%;${(9 - anim.tY + 0.5) * 10}%`} dur="0.4s" fill="freeze" />
+                            </circle>
+                          </g>
+                        ))}
+                      </svg>
+                    )}
+                    {Array.from({ length: 10 }).map((_, r) => {
+                        const y = 9 - r;
+                        return Array.from({ length: 10 }).map((_, x) => renderCell(y, x));
+                    })}
+                  </div>
+                </div>
+
+                {/* X-Axis Labels (Bottom) */}
+                {learningMode && (
+                    <div className="w-full flex mt-1 font-bold" style={{ paddingLeft: '1.75rem' }}> {/* Offset by Y-axis width */}
+                        {Array.from({length: 10}).map((_, i) => (
+                            <div key={i} className="flex-1 text-center text-xs sm:text-sm text-cyan-500">{i}</div>
+                        ))}
+                    </div>
+                )}
+              </div>
+
+              {/* View Toggles & Commands Overlay */}
+              <div className="mt-4 flex flex-wrap gap-4 justify-center shrink-0">
+                 <button onClick={() => setView('SECTOR')} className={`px-4 py-2 border ${view === 'SECTOR' ? 'bg-green-700 text-black font-bold' : 'border-green-700 hover:bg-green-900'}`}>SECTOR SCAN</button>
+                 <button onClick={() => { setView('GALAXY'); setGalaxyZView(player.qZ); }} className={`px-4 py-2 border ${view === 'GALAXY' ? 'bg-green-700 text-black font-bold' : 'border-green-700 hover:bg-green-900'}`}>GALAXY MAP</button>
+              </div>
+            </div>
+
+            {/* RIGHT PANEL - STATUS & CONTROLS */}
+            <div className="lg:w-1/3 flex flex-col bg-green-950/20">
+              
+              {/* STATUS */}
+              <div className="p-3 border-b-2 border-green-700 space-y-1 text-xs sm:text-sm shrink-0">
+                 <div className="flex justify-between"><span>CONDITION:</span> <span className={`font-bold animate-pulse ${getConditionColor()}`}>{enemies.length > 0 ? 'RED' : (player.energy < 500 ? 'YELLOW' : 'GREEN')}</span></div>
+                 <div className="flex justify-between"><span>QUADRANT:</span> <span>[X:{player.qX} Y:{player.qY} Z:{player.qZ}]</span></div>
+                 <div className="flex justify-between"><span>SECTOR:</span> <span>[X:{player.sX} Y:{player.sY}]</span></div>
+                 <div className="flex justify-between"><span>ENERGY:</span> <span className={player.energy < 500 ? 'text-red-500' : ''}>{player.energy} / {MAX_ENERGY}</span></div>
+                 <div className="flex justify-between"><span>TORPEDOES:</span> <span>{player.torpedoes} / {MAX_TORPEDOES}</span></div>
+                 <div className="flex justify-between"><span>SHIELDS:</span> <span className={player.shields < 100 ? 'text-yellow-500' : ''}>{player.shields} / {MAX_SHIELDS}</span></div>
+                 <div className="flex justify-between mt-1 pt-1 border-t border-green-800 text-red-400"><span>KLINGONS LEFT:</span> <span>{totalKlingons}</span></div>
+              </div>
+
+              {/* CONTROLS */}
+              {gameState === 'PLAYING' && (
+                <div className="p-3 border-b-2 border-green-700 flex flex-col gap-2 flex-1 overflow-y-auto min-h-0 pb-1">
+                   
+                   {/* NAV COMPUTER (LEARNING MODE) */}
+                   {learningMode ? (
+                     <div className="bg-black border-2 border-cyan-800 p-2 space-y-2 mb-1 shrink-0">
+                        <div className="text-cyan-400 font-bold border-b border-cyan-800 pb-1 text-xs tracking-widest flex justify-between">
+                          <span>NAV COMPUTER</span>
+                          <span className="text-cyan-600 animate-pulse">ONLINE</span>
+                        </div>
+                        
+                        {view === 'SECTOR' && (
+                          <div className="flex gap-2">
+                            <button onClick={() => setCommandMode('IMPULSE')} className={`flex-1 py-1 text-xs border ${commandMode === 'IMPULSE' ? 'bg-cyan-700/50 border-cyan-400 text-cyan-200' : 'border-cyan-900 text-cyan-700 hover:border-cyan-600'}`}>IMPULSE</button>
+                            <button onClick={() => setCommandMode('TORPEDO')} className={`flex-1 py-1 text-xs border ${commandMode === 'TORPEDO' ? 'bg-red-900/50 border-red-500 text-red-200' : 'border-cyan-900 text-cyan-700 hover:border-red-800'}`}>TORPEDO</button>
+                          </div>
+                        )}
+
+                        <div className="flex justify-between items-center text-sm font-bold text-cyan-400">
+                           <label className="flex items-center gap-1">X: <input type="number" min="0" max="9" value={navX} onChange={e=>setNavX(e.target.value)} className="w-10 sm:w-12 bg-cyan-900/30 border border-cyan-700 p-1 text-center outline-none" /></label>
+                           <label className="flex items-center gap-1">Y: <input type="number" min="0" max="9" value={navY} onChange={e=>setNavY(e.target.value)} className="w-10 sm:w-12 bg-cyan-900/30 border border-cyan-700 p-1 text-center outline-none" /></label>
+                           {view === 'GALAXY' && (
+                             <label className="flex items-center gap-1 text-purple-400">Z: <input type="number" min="0" max="9" value={navZ} onChange={e=>setNavZ(e.target.value)} className="w-10 sm:w-12 bg-purple-900/30 border border-purple-700 p-1 text-center outline-none" /></label>
+                           )}
+                        </div>
+                        
+                        {renderNavMath()}
+
+                        <button onClick={handleManualEngage} className={`w-full py-2 border font-bold tracking-widest transition-colors ${view === 'SECTOR' && commandMode === 'TORPEDO' ? 'border-red-500 hover:bg-red-900/50 text-red-300' : (view === 'GALAXY' ? 'border-purple-500 hover:bg-purple-900/50 text-purple-300' : 'border-cyan-500 hover:bg-cyan-900/50 text-cyan-300')}`}>
+                           {view === 'GALAXY' ? 'ENGAGE WARP' : `EXECUTE ${commandMode}`}
+                        </button>
+                     </div>
+                   ) : (
+                     // CLASSIC MODE CONTROLS
+                     <>
+                       <div className="flex gap-2">
+                         <button onClick={() => {setView('SECTOR'); setCommandMode('IMPULSE');}} className={`flex-1 py-2 border ${commandMode === 'IMPULSE' && view === 'SECTOR' ? 'bg-cyan-700/50 border-cyan-400 text-cyan-200' : 'border-green-700 hover:bg-green-800'}`}>IMPULSE</button>
+                         <button onClick={() => {setView('SECTOR'); setCommandMode('TORPEDO');}} className={`flex-1 py-2 border ${commandMode === 'TORPEDO' && view === 'SECTOR' ? 'bg-red-900/50 border-red-500 text-red-200' : 'border-green-700 hover:bg-green-800'}`}>TORPEDO</button>
+                       </div>
+                       <div className="text-xs text-center text-green-600 mb-2">
+                         {commandMode === 'IMPULSE' ? 'CLICK SECTOR MAP TO MOVE' : 'CLICK SECTOR MAP TO FIRE TORPEDO'}
+                       </div>
+                     </>
+                   )}
+
+                   {/* COMMON CONTROLS */}
+                   <div className="bg-black border border-green-800 p-2 space-y-2 shrink-0">
+                     <div className="flex items-center justify-between">
+                       <span className="text-sm w-20">PHASERS:</span>
+                       <input type="number" value={phaserInput} onChange={e => setPhaserInput(e.target.value)} className="bg-green-900/30 border border-green-700 text-green-400 w-20 p-1 text-right outline-none" />
+                       <button onClick={executePhasers} className="px-3 py-1 border border-green-500 hover:bg-green-700">FIRE</button>
+                     </div>
+                     <div className="flex items-center justify-between">
+                       <span className="text-sm w-20">SHIELDS:</span>
+                       <input type="number" value={shieldInput} onChange={e => setShieldInput(e.target.value)} className="bg-green-900/30 border border-green-700 text-green-400 w-20 p-1 text-right outline-none" />
+                       <button onClick={handleShields} className="px-3 py-1 border border-green-500 hover:bg-green-700">SET</button>
+                     </div>
+                   </div>
+
+                   <div className="grid grid-cols-2 gap-2 mt-1 shrink-0">
+                     {!learningMode && <button onClick={() => {setView('GALAXY'); logMsg('CLICK GALAXY MAP TO WARP.');}} className="py-2 border border-green-700 hover:bg-green-800 text-sm">WARP DRIVE</button>}
+                     <button onClick={useLongRangeSensors} className={`py-1 sm:py-2 border border-green-700 hover:bg-green-800 text-xs sm:text-sm ${learningMode ? 'col-span-2' : ''}`}>L.R. SENSORS</button>
+                     <button onClick={locateNearestStarbase} className="col-span-2 py-1 sm:py-2 border border-green-700 hover:bg-green-800 text-xs sm:text-sm">LOCATE NEAREST STARBASE</button>
+                   </div>
+                </div>
+              )}
+
+              {/* LOGS */}
+              <div className="h-32 sm:h-40 lg:flex-1 p-3 bg-black/80 font-mono text-sm overflow-y-auto border-t lg:border-t-0 border-green-700 flex flex-col shrink-0">
+                 {logs.map((log, i) => (
+                    <div key={i} className={`mb-1 whitespace-pre-wrap ${log.includes('RED ALERT') || log.includes('DESTROYED') || log.includes('DMG') ? 'text-red-400' : (log.includes('LEARNING') || log.includes('NAV COMPUTER') ? 'text-cyan-400' : 'text-green-400')}`}>
+                      {log}
+                    </div>
+                 ))}
+                 <div ref={logsEndRef} />
+              </div>
+
+            </div>
+          </div>
+        )}
+
+        {/* OVERLAYS */}
+        {confirmAction && (
+          <div className="absolute inset-0 bg-black/80 flex flex-col items-center justify-center text-center z-50 p-4">
+            <div className="bg-green-950 border-2 border-yellow-500 p-6 max-w-lg shadow-[0_0_20px_rgba(234,179,8,0.5)]">
+              <h2 className="text-2xl text-yellow-500 font-bold mb-4 drop-shadow-[0_0_5px_rgba(234,179,8,0.8)]">LOW ENERGY WARNING</h2>
+              <p className="text-lg mb-6 text-yellow-200">{confirmAction.message}</p>
+              <div className="flex justify-center gap-6">
+                <button onClick={confirmAction.onConfirm} className="px-6 py-2 border-2 border-red-500 hover:bg-red-500 hover:text-red-100 font-bold text-lg transition-colors">PROCEED</button>
+                <button onClick={confirmAction.onCancel} className="px-6 py-2 border-2 border-green-500 hover:bg-green-500 hover:text-black font-bold text-lg transition-colors">ABORT</button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {gameState === 'GAMEOVER' && (
+          <div className="absolute inset-0 bg-black/90 flex flex-col items-center justify-center text-center z-50">
+            <h1 className="text-5xl text-red-600 font-bold mb-4 drop-shadow-[0_0_10px_red]">GAME OVER</h1>
+            <p className="text-xl mb-8">THE ENTERPRISE HAS BEEN DESTROYED.</p>
+            <button onClick={() => setGameState('START')} className="px-8 py-3 border-2 border-green-500 hover:bg-green-500 hover:text-black font-bold text-xl">PLAY AGAIN</button>
+          </div>
+        )}
+
+        {gameState === 'WIN' && (
+          <div className="absolute inset-0 bg-black/90 flex flex-col items-center justify-center text-center z-50">
+            <h1 className="text-5xl text-cyan-400 font-bold mb-4 drop-shadow-[0_0_10px_cyan]">VICTORY</h1>
+            <p className="text-xl mb-8">ALL KLINGON FORCES ELIMINATED.<br/>STARFLEET COMMENDS YOU.</p>
+            <button onClick={() => setGameState('START')} className="px-8 py-3 border-2 border-green-500 hover:bg-green-500 hover:text-black font-bold text-xl">NEW MISSION</button>
+          </div>
+        )}
+
+      </div>
+    </div>
+  );
+}

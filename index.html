@@ -989,7 +989,7 @@
                       )}
 
                       {/* LOGS */}
-                      <div className="h-32 sm:h-40 lg:flex-1 p-3 bg-black/80 font-mono text-sm overflow-y-auto border-t lg:border-t-0 border-green-700 flex flex-col shrink-0">
+                      <div className="h-48 lg:h-64 p-3 bg-black/80 font-mono text-sm overflow-y-auto border-t lg:border-t-0 border-green-700 flex flex-col shrink-0">
                          {logs.map((log, i) => (
                             <div key={i} className={`mb-1 whitespace-pre-wrap ${log.includes('RED ALERT') || log.includes('DESTROYED') || log.includes('DMG') ? 'text-red-400' : (log.includes('LEARNING') || log.includes('NAV COMPUTER') ? 'text-cyan-400' : 'text-green-400')}`}>
                               {log}
